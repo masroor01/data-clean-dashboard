@@ -1,0 +1,10 @@
+{
+  "name": "data-clean-dashboard",
+  "version": "1.0.0",
+  "description": "General-purpose tabular data cleaning & preprocessing dashboard -- React frontend + Express backend, single deployable Node process. Inspired by TOP Digital Twin's data-cleaning methodology, but implements only the generic, dataset-agnostic techniques (see README).",
+  "private": true,
+  "scripts": {
+    "build": "npm install --prefix frontend && npm run build --prefix frontend && npm install --prefix backend",
+    "start": "npm start --prefix backend"
+  }
+}
