@@ -17,9 +17,38 @@ const NUMERIC_RE = /^-?\d+(\.\d+)?(e-?\d+)?$/i;
 const BOOL_TRUE = new Set(['true', 'yes', 'y', '1']);
 const BOOL_FALSE = new Set(['false', 'no', 'n', '0']);
 const DATE_HINT_RE = /^\d{4}-\d{2}-\d{2}|^\d{1,2}\/\d{1,2}\/\d{2,4}|^\d{1,2}-\d{1,2}-\d{2,4}/;
+const CURRENCY_SYMBOLS_RE = /[$€£¥₹₩¢]/g;
+// Unlikely-to-collide field separator for building a row identity key from
+// concatenated column values -- joining with '' let two DIFFERENT rows
+// produce the SAME key (e.g. {a:"1",b:"23"} and {a:"12",b:"3"} both -> "123"),
+// silently over-counting duplicates.
+const ROW_KEY_SEP = '';
 
 function isBlank(v) {
   return v === null || v === undefined || v === '' || (typeof v === 'string' && v.trim() === '');
+}
+
+/** Strips common real-world numeric formatting down to a plain numeric
+ * string -- e.g. "($1,234.56)" -> "-1234.56", "45%" -> "45". The %% sign
+ * is stripped, NOT divided by 100 -- keeps the number as displayed rather
+ * than silently asserting a fraction-vs-percent convention this tool has
+ * no way to know for sure. */
+function stripNumericFormatting(raw) {
+  let s = String(raw).trim();
+  if (s === '') return s;
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) { negative = true; s = s.slice(1, -1).trim(); }
+  s = s.replace(CURRENCY_SYMBOLS_RE, '').replace(/,/g, '').replace(/%/g, '').trim();
+  if (negative && s && !s.startsWith('-')) s = '-' + s;
+  return s;
+}
+
+function isNumericLike(v) {
+  return NUMERIC_RE.test(stripNumericFormatting(String(v).trim()));
+}
+
+function rowKey(row, columns) {
+  return columns.map((c) => String(row[c] ?? '').trim()).join(ROW_KEY_SEP);
 }
 
 function tryParseDate(v) {
@@ -36,7 +65,7 @@ export function detectColumnType(values) {
   const sample = values.filter((v) => !isBlank(v)).slice(0, 500);
   if (sample.length === 0) return 'empty';
 
-  const numericCount = sample.filter((v) => NUMERIC_RE.test(String(v).trim())).length;
+  const numericCount = sample.filter((v) => isNumericLike(v)).length;
   if (numericCount / sample.length >= 0.95) return 'numeric';
 
   const boolCount = sample.filter((v) => {
@@ -54,7 +83,7 @@ export function detectColumnType(values) {
 
 function toNumber(v) {
   if (isBlank(v)) return null;
-  const n = Number(String(v).replace(/,/g, ''));
+  const n = Number(stripNumericFormatting(String(v)));
   return Number.isFinite(n) ? n : null;
 }
 
@@ -103,6 +132,11 @@ export function profileDataset(rows, columns) {
         profile.suggestedOutlierBounds = { low: +(q1 - 1.5 * iqr).toFixed(4), high: +(q3 + 1.5 * iqr).toFixed(4) };
         profile.outlierCount = nums.filter((n) => n < profile.suggestedOutlierBounds.low || n > profile.suggestedOutlierBounds.high).length;
       }
+      // True if any real value needs stripping before it's plain-numeric
+      // (currency symbol, thousands comma, %, accounting parens) -- lets
+      // the UI offer an explicit normalize-numeric-formatting action
+      // rather than silently rewriting values nobody asked to change.
+      profile.hasNumericFormatting = nonBlank.some((v) => !NUMERIC_RE.test(String(v).trim()));
     }
     return profile;
   });
@@ -111,7 +145,7 @@ export function profileDataset(rows, columns) {
   const seen = new Map();
   let duplicateRowCount = 0;
   for (const r of rows) {
-    const key = columns.map((c) => String(r[c] ?? '')).join('');
+    const key = rowKey(r, columns);
     seen.set(key, (seen.get(key) || 0) + 1);
   }
   for (const count of seen.values()) if (count > 1) duplicateRowCount += count - 1;
@@ -344,6 +378,121 @@ function knnImpute(rows, targetCol, featureCols, k) {
   return { filledValues, imputed };
 }
 
+// -- Isolation Forest (multivariate outlier detection) --------------------
+// Judges a ROW as anomalous based on how easily it separates from the rest
+// of the dataset across MULTIPLE numeric columns at once -- catches joint
+// anomalies that look normal in any single column's own IQR/rolling-Z
+// check but are unusual in combination (e.g. a low price at a high
+// volume, when low price and high volume are each individually common).
+// Standard algorithm (Liu, Ting, Zhou 2008): build many random "isolation
+// trees" on small subsamples; anomalous points isolate (reach a leaf)
+// faster on average than normal points, since fewer random splits are
+// needed to wall off an outlier.
+const MAX_ISOLATION_FOREST_ROWS = 100000;
+const IF_N_TREES = 100;
+const IF_SAMPLE_SIZE = 256;
+
+// Deterministic small PRNG (mulberry32) so re-running "Apply Cleaning"
+// with identical settings gives identical flags -- Math.random() would
+// make the same config produce a different result every run, which would
+// look like a bug.
+function mulberry32(seed) {
+  let a = seed;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Average path length of an unsuccessful BST search over n items --
+// normalizes tree depth into a comparable anomaly score across forests
+// built on different sample sizes.
+function averagePathLengthC(n) {
+  if (n <= 1) return 0;
+  if (n === 2) return 1;
+  return 2 * (Math.log(n - 1) + 0.5772156649) - (2 * (n - 1)) / n;
+}
+
+function buildIsolationTree(indices, matrix, featureIdxs, rng, depth, maxDepth) {
+  if (depth >= maxDepth || indices.length <= 1) return { size: indices.length };
+
+  const candidateFeatures = featureIdxs.filter((f) => {
+    let min = Infinity, max = -Infinity;
+    for (const i of indices) {
+      const v = matrix[i][f];
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    return max > min;
+  });
+  if (!candidateFeatures.length) return { size: indices.length };
+
+  const feature = candidateFeatures[Math.floor(rng() * candidateFeatures.length)];
+  let min = Infinity, max = -Infinity;
+  for (const i of indices) {
+    const v = matrix[i][feature];
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const splitValue = min + rng() * (max - min);
+  const left = [], right = [];
+  for (const i of indices) (matrix[i][feature] < splitValue ? left : right).push(i);
+  if (!left.length || !right.length) return { size: indices.length };
+
+  return {
+    feature, splitValue,
+    left: buildIsolationTree(left, matrix, featureIdxs, rng, depth + 1, maxDepth),
+    right: buildIsolationTree(right, matrix, featureIdxs, rng, depth + 1, maxDepth),
+  };
+}
+
+function pathLength(node, vec, depth) {
+  if (node.feature === undefined) return depth + averagePathLengthC(node.size);
+  const branch = vec[node.feature] < node.splitValue ? node.left : node.right;
+  return pathLength(branch, vec, depth + 1);
+}
+
+/** Returns { scores, evaluatedCount } -- scores[i] in (0,1) for rows with
+ * every selected feature present (~0.5 = normal, closer to 1 = more
+ * anomalous), null for rows excluded because a selected feature was
+ * missing (never fabricates a score from incomplete data). */
+function isolationForestScores(rows, featureCols, seed) {
+  const rawMatrix = rows.map((r) => featureCols.map((c) => toNumber(r[c])));
+  const evaluatedIdxs = [];
+  rawMatrix.forEach((row, i) => { if (row.every((v) => v !== null)) evaluatedIdxs.push(i); });
+
+  const scores = new Array(rows.length).fill(null);
+  if (evaluatedIdxs.length < 10) return { scores, evaluatedCount: 0 };
+
+  const featureIdxs = featureCols.map((_, j) => j);
+  const rng = mulberry32(seed);
+  const sampleSize = Math.min(IF_SAMPLE_SIZE, evaluatedIdxs.length);
+  const maxDepth = Math.ceil(Math.log2(Math.max(sampleSize, 2)));
+
+  const trees = [];
+  for (let t = 0; t < IF_N_TREES; t++) {
+    const pool = [...evaluatedIdxs];
+    const sample = [];
+    for (let k = 0; k < sampleSize; k++) {
+      const idx = Math.floor(rng() * pool.length);
+      sample.push(pool[idx]);
+      pool[idx] = pool[pool.length - 1];
+      pool.pop();
+    }
+    trees.push(buildIsolationTree(sample, rawMatrix, featureIdxs, rng, 0, maxDepth));
+  }
+
+  const c = averagePathLengthC(sampleSize);
+  for (const i of evaluatedIdxs) {
+    let totalPath = 0;
+    for (const tree of trees) totalPath += pathLength(tree, rawMatrix[i], 0);
+    scores[i] = Math.pow(2, -(totalPath / trees.length) / c);
+  }
+  return { scores, evaluatedCount: evaluatedIdxs.length };
+}
+
 function mode(values) {
   const counts = new Map();
   for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
@@ -433,6 +582,24 @@ export function applyCleaning(rows, columns, config) {
     log.push(`"${colName}": merged ${uniqueCount} unique value(s) into ${clusterCount} canonical entit${clusterCount === 1 ? 'y' : 'ies'} (threshold ${threshold}); ${changed} cell(s) updated.`);
   }
 
+  // Normalize numeric formatting -- rewrites a numeric column's real values
+  // to plain numbers (strips currency symbols, thousands commas, %, and
+  // accounting-style parens-negative). Opt-in per column, since it changes
+  // every real cell's displayed form, not just gap-fills -- consistent
+  // with this engine's rule of never rewriting more than the user asked for.
+  for (const [colName, colConfig] of Object.entries(config.perColumn || {})) {
+    if (!colConfig.normalizeNumericFormat || !workingColumns.includes(colName)) continue;
+    let changed = 0;
+    workingRows.forEach((r) => {
+      const raw = r[colName];
+      if (isBlank(raw)) return;
+      const n = toNumber(raw);
+      if (n === null) return;
+      if (String(raw) !== String(n)) { r[colName] = n; changed++; }
+    });
+    log.push(`"${colName}": normalized ${changed} value(s) to plain numeric form (stripped currency/%/thousands-comma formatting).`);
+  }
+
   if (config.normalizeColumnNames) {
     const renameMap = {};
     workingColumns = workingColumns.map((c) => {
@@ -455,7 +622,7 @@ export function applyCleaning(rows, columns, config) {
     const seen = new Set();
     const before = workingRows.length;
     workingRows = workingRows.filter((r) => {
-      const key = workingColumns.map((c) => String(r[c] ?? '')).join('');
+      const key = rowKey(r, workingColumns);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -616,6 +783,38 @@ export function applyCleaning(rows, columns, config) {
     });
     if (!workingColumns.includes(flagCol)) workingColumns.push(flagCol);
     log.push(`"${colName}": flagged ${flagged} value(s) outside [${low}, ${high}] as "${flagCol}" -- not removed, for manual review.`);
+  }
+
+  // Multivariate outlier detection (Isolation Forest) -- dataset-level,
+  // not per-column, since it judges a ROW as anomalous using several
+  // columns jointly. Adds a shared score + flag column, never removes rows.
+  if (config.isolationForest && config.isolationForest.columns) {
+    const ifCols = config.isolationForest.columns.filter((c) => workingColumns.includes(c));
+    if (ifCols.length < 2) {
+      throw new Error(`Isolation Forest needs at least 2 valid numeric columns (got ${ifCols.length}).`);
+    }
+    if (workingRows.length > MAX_ISOLATION_FOREST_ROWS) {
+      throw new Error(`Isolation Forest needs the dataset under ${MAX_ISOLATION_FOREST_ROWS.toLocaleString()} rows (this file has ${workingRows.length.toLocaleString()}) -- use the per-column IQR or rolling Z-score outlier methods instead.`);
+    }
+    const threshold = config.isolationForest.threshold ?? 0.6;
+    const { scores, evaluatedCount } = isolationForestScores(workingRows, ifCols, 42);
+    const scoreCol = 'isolation_outlier_score';
+    const flagCol = 'isolation_outlier_flag';
+    let flagged = 0;
+    workingRows.forEach((r, i) => {
+      const s = scores[i];
+      r[scoreCol] = s === null ? '' : +s.toFixed(4);
+      const isOutlier = s !== null && s > threshold;
+      r[flagCol] = s === null ? '' : (isOutlier ? 1 : 0);
+      if (isOutlier) flagged++;
+    });
+    if (!workingColumns.includes(scoreCol)) workingColumns.push(scoreCol);
+    if (!workingColumns.includes(flagCol)) workingColumns.push(flagCol);
+    if (evaluatedCount === 0) {
+      log.push(`Isolation Forest: skipped -- fewer than 10 rows had every selected column [${ifCols.join(', ')}] present.`);
+    } else {
+      log.push(`Isolation Forest [${ifCols.join(', ')}]: flagged ${flagged} of ${evaluatedCount} evaluated row(s) with anomaly score > ${threshold} as "${flagCol}" (raw score in "${scoreCol}") -- not removed, for manual review.`);
+    }
   }
 
   return { rows: workingRows, columns: workingColumns, log };

@@ -104,6 +104,19 @@ function ColumnRow({ col, suggestion, config, onChange, dateColumns, hasDateColu
           </div>
         )}
 
+        {col.type === 'numeric' && col.hasNumericFormatting && (
+          <div className="flex flex-col gap-1.5 pt-1 border-t" style={{ borderColor: 'var(--border-color)' }}>
+            <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+              <input
+                type="checkbox"
+                checked={!!config.normalizeNumericFormat}
+                onChange={(e) => onChange({ ...config, normalizeNumericFormat: e.target.checked })}
+              />
+              Normalize to plain numbers (detected currency/%/comma formatting)
+            </label>
+          </div>
+        )}
+
         {hasOutlierSuggestion && (
           <div className="flex flex-col gap-1.5 pt-1 border-t" style={{ borderColor: 'var(--border-color)' }}>
             <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
@@ -190,6 +203,62 @@ function ColumnRow({ col, suggestion, config, onChange, dateColumns, hasDateColu
   );
 }
 
+// Must match backend/src/engine.js's MAX_ISOLATION_FOREST_ROWS.
+const MAX_ISOLATION_FOREST_ROWS = 100000;
+
+function IsolationForestSection({ profile, config, setConfig }) {
+  const numericCols = profile.columns.filter((c) => c.type === 'numeric');
+  if (numericCols.length < 2) return null;
+  const tooManyRows = profile.nRows > MAX_ISOLATION_FOREST_ROWS;
+  const selected = config.isolationForest?.columns || [];
+  const enabled = selected.length >= 2;
+
+  const toggleColumn = (name) => {
+    const next = selected.includes(name) ? selected.filter((c) => c !== name) : [...selected, name];
+    setConfig((p) => ({ ...p, isolationForest: next.length ? { ...p.isolationForest, columns: next } : undefined }));
+  };
+
+  return (
+    <div className="mb-5 pb-5 border-b" style={{ borderColor: 'var(--border-color)' }}>
+      <p className="text-sm font-medium text-[var(--text-primary)] mb-1">Multivariate outlier detection (Isolation Forest)</p>
+      <p className="text-xs text-[var(--text-muted)] mb-2">
+        Flags rows that are jointly unusual across several columns at once — catches anomalies that look normal in any single column alone.
+      </p>
+      {tooManyRows && (
+        <p className="text-xs text-amber-600 mb-2">Dataset has {profile.nRows.toLocaleString()} rows, over the {MAX_ISOLATION_FOREST_ROWS.toLocaleString()} cap for this method.</p>
+      )}
+      <div className="flex flex-wrap gap-2 mb-2">
+        {numericCols.map((c) => (
+          <label key={c.name} className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full border cursor-pointer"
+            style={{
+              borderColor: selected.includes(c.name) ? 'var(--brand)' : 'var(--border-color-strong)',
+              background: selected.includes(c.name) ? 'color-mix(in srgb, var(--brand) 12%, transparent)' : 'var(--card-bg)',
+              color: selected.includes(c.name) ? 'var(--brand)' : 'var(--text-secondary)',
+            }}
+          >
+            <input type="checkbox" className="hidden" disabled={tooManyRows} checked={selected.includes(c.name)} onChange={() => toggleColumn(c.name)} />
+            {c.name}
+          </label>
+        ))}
+      </div>
+      {enabled && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-[var(--text-muted)]">Anomaly score threshold:</span>
+          <input
+            type="range" min="0.5" max="0.85" step="0.01"
+            value={config.isolationForest?.threshold ?? 0.6}
+            onChange={(e) => setConfig((p) => ({ ...p, isolationForest: { ...p.isolationForest, threshold: Number(e.target.value) } }))}
+            className="w-32"
+          />
+          <span className="font-mono text-[var(--text-secondary)]">{(config.isolationForest?.threshold ?? 0.6).toFixed(2)}</span>
+          <span className="text-[var(--text-muted)]">(higher = stricter, flags fewer rows)</span>
+        </div>
+      )}
+      {selected.length === 1 && <p className="text-xs text-[var(--text-muted)] mt-1">Select at least one more column.</p>}
+    </div>
+  );
+}
+
 export default function CleaningControls({ profile, suggestions, config, setConfig }) {
   const dateColumns = profile.dateColumns || [];
   const hasDateColumn = !!config.dateColumn;
@@ -240,6 +309,8 @@ export default function CleaningControls({ profile, suggestions, config, setConf
           </>
         )}
       </div>
+
+      <IsolationForestSection profile={profile} config={config} setConfig={setConfig} />
 
       <div>
         {profile.columns.map((col) => (

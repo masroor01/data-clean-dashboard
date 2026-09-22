@@ -73,6 +73,12 @@ const CATEGORIES = [
         eligible: (p) => p.dateColumns.length > 0 && p.columns.some((c) => c.type === 'numeric'),
         need: 'A date column + a numeric column.',
       },
+      {
+        name: 'Isolation Forest',
+        detail: 'Flags a ROW as anomalous based on how easily it separates from the rest of the dataset across several numeric columns at once — catches joint anomalies that look normal in any single column checked alone (e.g. an unusual combination of otherwise-ordinary values).',
+        eligible: (p) => p.columns.filter((c) => c.type === 'numeric').length >= 2,
+        need: 'At least 2 numeric columns.',
+      },
     ],
   },
   {
@@ -85,6 +91,12 @@ const CATEGORIES = [
         detail: 'Lowercases column names and replaces spaces/punctuation with underscores, for a predictable schema downstream.',
         eligible: () => true,
         need: 'Always available.',
+      },
+      {
+        name: 'Numeric format normalization',
+        detail: 'Strips currency symbols, thousands commas, %, and accounting-style parentheses-negatives down to plain numbers (e.g. "($1,234.56)" → -1234.56). Also fixes type detection so formatted numeric columns unlock the other numeric techniques in the first place.',
+        eligible: (p) => p.columns.some((c) => c.type === 'numeric' && c.hasNumericFormatting),
+        need: 'A numeric column with detected currency/%/comma formatting.',
       },
     ],
   },

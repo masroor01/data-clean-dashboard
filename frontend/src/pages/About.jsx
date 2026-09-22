@@ -28,6 +28,8 @@ export default function About() {
           <li>Suggests outlier bounds via the standard 1.5×IQR rule, or a rolling Z-score against a
             trailing window when a date column is set (adapts to a trend/level shift over time instead
             of one fixed global fence) — always editable, never auto-applied.</li>
+          <li>Flags jointly-anomalous rows with Isolation Forest — catches a row that's unusual across
+            several numeric columns at once even when each column looks ordinary on its own.</li>
           <li>Fills missing values with gap-length-aware logic: short gaps are linearly interpolated,
             medium gaps use a same-group/same-period median, long gaps are left missing on purpose —
             or via KNN, filling from the average of the k most similar rows (by every other numeric
@@ -35,6 +37,9 @@ export default function About() {
           <li>Merges near-duplicate text values within a column (e.g. "Apple Inc." / "Apple" /
             "APPLE INC" → one canonical label) using a combination of edit-distance and token-overlap
             similarity, so both typos and abbreviation/subset variants get caught.</li>
+          <li>Recognizes currency, percentage, and comma-formatted numbers (e.g. "$1,234.56", "45%")
+            as numeric — fixing a real gap where such columns would otherwise be typed as text and
+            miss out on every numeric technique — and can normalize them to plain numbers on request.</li>
           <li>Adds a <code>_was_missing</code> flag column for every value it fills, so a cleaned dataset
             never hides which numbers were real and which were imputed.</li>
           <li>Lets you download the cleaned CSV, a plain-text report of every change made, and a JSON
