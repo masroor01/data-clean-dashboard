@@ -25,9 +25,14 @@ export default function About() {
         <ul className="list-disc list-inside space-y-1">
           <li>Infers column types (numeric, categorical, boolean, date, text) from the uploaded data.</li>
           <li>Profiles missingness, duplicates, and unique counts per column.</li>
-          <li>Suggests outlier bounds via the standard 1.5×IQR rule — always editable, never auto-applied.</li>
+          <li>Suggests outlier bounds via the standard 1.5×IQR rule, or a rolling Z-score against a
+            trailing window when a date column is set (adapts to a trend/level shift over time instead
+            of one fixed global fence) — always editable, never auto-applied.</li>
           <li>Fills missing values with gap-length-aware logic: short gaps are linearly interpolated,
             medium gaps use a same-group/same-period median, long gaps are left missing on purpose.</li>
+          <li>Merges near-duplicate text values within a column (e.g. "Apple Inc." / "Apple" /
+            "APPLE INC" → one canonical label) using a combination of edit-distance and token-overlap
+            similarity, so both typos and abbreviation/subset variants get caught.</li>
           <li>Adds a <code>_was_missing</code> flag column for every value it fills, so a cleaned dataset
             never hides which numbers were real and which were imputed.</li>
           <li>Lets you download the cleaned CSV, a plain-text report of every change made, and a JSON

@@ -145,6 +145,137 @@ export function suggestStrategies(profile) {
   });
 }
 
+// ── Fuzzy deduplication (entity resolution) ─────────────────────────────
+// Normalizes near-duplicate text VALUES within a column (e.g. "Apple Inc."
+// / "Apple" / "APPLE INC" -> one canonical label) -- distinct from
+// dropDuplicates, which removes whole duplicate ROWS. Uses normalized
+// Levenshtein similarity (no new dependency) with greedy, frequency-first
+// clustering: the most common spelling in the data becomes each cluster's
+// canonical representative, since that's usually the correct one.
+const MAX_FUZZY_UNIQUE = 5000; // pairwise comparison is O(k^2); cap keeps this fast
+
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array(n + 1);
+  let curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n];
+}
+
+function levenshteinSimilarity(a, b) {
+  if (a === b) return 1;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1;
+  return 1 - levenshtein(a, b) / maxLen;
+}
+
+function tokenize(s) {
+  return new Set(s.split(/[^a-z0-9]+/i).map((t) => t.toLowerCase()).filter(Boolean));
+}
+
+/** Overlap coefficient (|intersection| / smaller set size) -- catches
+ * subset/abbreviation variants like "Apple" vs "Apple Inc." (shared token
+ * "apple" fully contained in the larger name) that plain edit distance
+ * scores as dissimilar because the strings differ in length. */
+function tokenOverlapSimilarity(a, b) {
+  const ta = tokenize(a), tb = tokenize(b);
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  return inter / Math.min(ta.size, tb.size);
+}
+
+/** Combines edit-distance similarity (catches typos within a token, e.g.
+ * "Microsft" vs "Microsoft") with token-overlap similarity (catches
+ * added/dropped tokens, e.g. "Apple" vs "Apple Inc.") -- neither alone
+ * covers both of fuzzy dedup's two classic cases well. */
+function stringSimilarity(a, b) {
+  return Math.max(levenshteinSimilarity(a, b), tokenOverlapSimilarity(a, b));
+}
+
+/** Clusters near-duplicate values in a column and returns a value->canonical map. */
+function fuzzyDedupeColumn(values, threshold) {
+  const freq = new Map();
+  for (const v of values) {
+    if (isBlank(v)) continue;
+    const s = String(v);
+    freq.set(s, (freq.get(s) || 0) + 1);
+  }
+  const uniques = [...freq.keys()];
+  if (uniques.length > MAX_FUZZY_UNIQUE) {
+    throw new Error(`Too many unique values (${uniques.length}) for fuzzy dedup -- max ${MAX_FUZZY_UNIQUE}.`);
+  }
+  // Most-frequent spelling first, so common variants become the canonical
+  // representative rather than whatever happened to appear first in the file.
+  uniques.sort((a, b) => freq.get(b) - freq.get(a));
+  const norm = (s) => s.trim().toLowerCase();
+  const clusters = []; // { rep, members: string[] }
+  for (const v of uniques) {
+    const nv = norm(v);
+    let best = null, bestSim = 0;
+    for (const c of clusters) {
+      const sim = stringSimilarity(nv, norm(c.rep));
+      if (sim > bestSim) { bestSim = sim; best = c; }
+    }
+    if (best && bestSim >= threshold) {
+      best.members.push(v);
+    } else {
+      clusters.push({ rep: v, members: [v] });
+    }
+  }
+  const mapping = new Map();
+  for (const c of clusters) for (const m of c.members) mapping.set(m, c.rep);
+  return { mapping, clusterCount: clusters.length, uniqueCount: uniques.length };
+}
+
+// ── Rolling Z-score outlier detection ───────────────────────────────────
+// Alternative to the fixed 1.5xIQR fence -- flags a value against a
+// trailing window's own mean/std (within date order, optionally per
+// group) instead of one global threshold, so it adapts to trend/level
+// shifts over time rather than assuming the whole series is stationary.
+function rollingZScoreOutliers(rows, colName, dateCol, groupCol, windowSize, zThreshold) {
+  const groups = groupCol ? [...new Set(rows.map((r) => r[groupCol]))] : ['__all__'];
+  const flags = new Array(rows.length).fill(0);
+  let flagged = 0, evaluated = 0;
+
+  for (const g of groups) {
+    const idxs = rows
+      .map((r, i) => ({ r, i }))
+      .filter(({ r }) => !groupCol || r[groupCol] === g)
+      .sort((a, b) => new Date(a.r[dateCol]) - new Date(b.r[dateCol]))
+      .map(({ i }) => i);
+
+    const series = idxs.map((i) => toNumber(rows[i][colName]));
+    for (let k = 0; k < series.length; k++) {
+      const val = series[k];
+      if (val === null) continue;
+      const windowVals = series.slice(Math.max(0, k - windowSize), k).filter((v) => v !== null);
+      if (windowVals.length < Math.min(3, windowSize)) continue; // not enough history to judge yet
+      const mean = windowVals.reduce((a, b) => a + b, 0) / windowVals.length;
+      const variance = windowVals.reduce((a, b) => a + (b - mean) ** 2, 0) / windowVals.length;
+      const std = Math.sqrt(variance);
+      evaluated++;
+      if (std === 0) continue; // flat window -- any deviation would be trivially "infinite" z, skip rather than false-flag
+      const z = Math.abs((val - mean) / std);
+      if (z > zThreshold) {
+        flags[idxs[k]] = 1;
+        flagged++;
+      }
+    }
+  }
+  return { flags, flagged, evaluated };
+}
+
 function mode(values) {
   const counts = new Map();
   for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
@@ -201,13 +332,38 @@ function linearInterpolate(values) {
  *   groupColumn: string|null,      // optional grouping key (e.g. "market")
  *   shortGapMax: number,           // default 2
  *   mediumGapMax: number,          // default 8
- *   perColumn: { [colName]: { missingStrategy, outlierAction, outlierBounds } }
+ *   perColumn: { [colName]: {
+ *     missingStrategy, outlierAction, outlierBounds,
+ *     fuzzyDedup: { threshold } | undefined,
+ *     outlierMethod: 'iqr' | 'rolling_zscore',
+ *     rollingWindow, zThreshold  // used when outlierMethod === 'rolling_zscore'
+ *   } }
  * }
  */
 export function applyCleaning(rows, columns, config) {
   const log = [];
   let workingRows = rows.map((r) => ({ ...r }));
   let workingColumns = [...columns];
+
+  // Fuzzy deduplication -- normalizes near-duplicate text VALUES within a
+  // column (entity resolution) BEFORE exact row-level dedup, so rows that
+  // only differ by a now-normalized spelling also get caught by
+  // dropDuplicates below.
+  for (const [colName, colConfig] of Object.entries(config.perColumn || {})) {
+    if (!colConfig.fuzzyDedup || !workingColumns.includes(colName)) continue;
+    const threshold = colConfig.fuzzyDedup.threshold ?? 0.85;
+    const { mapping, clusterCount, uniqueCount } = fuzzyDedupeColumn(
+      workingRows.map((r) => r[colName]), threshold,
+    );
+    let changed = 0;
+    workingRows.forEach((r) => {
+      const v = r[colName];
+      if (isBlank(v)) return;
+      const canonical = mapping.get(String(v));
+      if (canonical !== undefined && canonical !== v) { r[colName] = canonical; changed++; }
+    });
+    log.push(`"${colName}": merged ${uniqueCount} unique value(s) into ${clusterCount} canonical entit${clusterCount === 1 ? 'y' : 'ies'} (threshold ${threshold}); ${changed} cell(s) updated.`);
+  }
 
   if (config.normalizeColumnNames) {
     const renameMap = {};
@@ -342,12 +498,28 @@ export function applyCleaning(rows, columns, config) {
   }
 
   // Outlier flagging -- NEVER auto-clips/drops a value; always adds a
-  // review flag column, since "outside the IQR fence" is a statistical
-  // suggestion, not proof of a data error (see engine.js header comment).
+  // review flag column, since "outside the IQR fence" (or "|z| too high")
+  // is a statistical suggestion, not proof of a data error (see engine.js
+  // header comment).
   for (const [colName, colConfig] of Object.entries(config.perColumn || {})) {
-    if (colConfig.outlierAction !== 'flag' || !colConfig.outlierBounds) continue;
-    const { low, high } = colConfig.outlierBounds;
+    if (colConfig.outlierAction !== 'flag') continue;
     const flagCol = `${colName}_outlier_flag`;
+
+    if (colConfig.outlierMethod === 'rolling_zscore') {
+      if (!config.dateColumn) continue; // rolling z-score needs a date order to roll over
+      const windowSize = colConfig.rollingWindow ?? 8;
+      const zThreshold = colConfig.zThreshold ?? 3;
+      const { flags, flagged, evaluated } = rollingZScoreOutliers(
+        workingRows, colName, config.dateColumn, config.groupColumn, windowSize, zThreshold,
+      );
+      workingRows.forEach((r, i) => { r[flagCol] = flags[i]; });
+      if (!workingColumns.includes(flagCol)) workingColumns.push(flagCol);
+      log.push(`"${colName}": flagged ${flagged} of ${evaluated} evaluated value(s) with |z|>${zThreshold} vs. a trailing ${windowSize}-period rolling mean/std as "${flagCol}" -- not removed, for manual review.`);
+      continue;
+    }
+
+    if (!colConfig.outlierBounds) continue;
+    const { low, high } = colConfig.outlierBounds;
     let flagged = 0;
     workingRows.forEach((r) => {
       const n = toNumber(r[colName]);
