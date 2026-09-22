@@ -1,6 +1,6 @@
 import React from 'react';
 
-const TYPE_BADGE = {
+export const TYPE_BADGE = {
   numeric: { label: 'numeric', color: '#2563EB' },
   categorical: { label: 'categorical', color: '#7C3AED' },
   boolean: { label: 'boolean', color: '#059669' },
