@@ -276,6 +276,74 @@ function rollingZScoreOutliers(rows, colName, dateCol, groupCol, windowSize, zTh
   return { flags, flagged, evaluated };
 }
 
+// ── KNN imputation ───────────────────────────────────────────────────────
+// Fills a missing value from the average of its k nearest rows (by other
+// numeric columns), rather than one dataset-wide median/mean -- picks up
+// on multivariate structure a single-column fill can't see (e.g. a
+// missing value on a row that otherwise looks like a specific cluster of
+// other rows gets filled toward that cluster, not the global average).
+const MAX_KNN_ROWS = 20000; // distance computation is roughly O(missing x n); keeps this responsive in a single Node request
+const DEFAULT_KNN_K = 5;
+
+/** Euclidean distance over only the coordinates present in both vectors,
+ * scaled up by (total dims / present dims) so a row with some missing
+ * feature values can still be compared fairly (standard "nan-euclidean"
+ * approach) rather than being excluded entirely. */
+function nanEuclidean(a, b) {
+  let sumSq = 0, present = 0;
+  for (let j = 0; j < a.length; j++) {
+    if (a[j] === null || b[j] === null) continue;
+    sumSq += (a[j] - b[j]) ** 2;
+    present++;
+  }
+  if (present === 0) return null;
+  return Math.sqrt(sumSq * (a.length / present));
+}
+
+/** Returns { filledValues, imputed } -- filledValues[i] is the KNN-imputed
+ * value for row i if it was missing and had usable neighbors, else null. */
+function knnImpute(rows, targetCol, featureCols, k) {
+  const rawMatrix = rows.map((r) => featureCols.map((c) => toNumber(r[c])));
+  // Z-normalize each feature so no single column's scale dominates distance.
+  const stats = featureCols.map((_, j) => {
+    const vals = rawMatrix.map((row) => row[j]).filter((v) => v !== null);
+    if (!vals.length) return { mean: 0, std: 1 };
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
+    return { mean, std: Math.sqrt(variance) || 1 };
+  });
+  const normMatrix = rawMatrix.map((row) => row.map((v, j) => (v === null ? null : (v - stats[j].mean) / stats[j].std)));
+
+  const targetVals = rows.map((r) => toNumber(r[targetCol]));
+  const donorIdxs = [];
+  targetVals.forEach((v, i) => { if (v !== null) donorIdxs.push(i); });
+
+  const filledValues = new Array(rows.length).fill(null);
+  let imputed = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (targetVals[i] !== null) continue;
+    const vecI = normMatrix[i];
+    const candidates = [];
+    for (const j of donorIdxs) {
+      const dist = nanEuclidean(vecI, normMatrix[j]);
+      if (dist === null) continue;
+      candidates.push({ dist, val: targetVals[j] });
+    }
+    if (!candidates.length) continue;
+    candidates.sort((a, b) => a.dist - b.dist);
+    const nearest = candidates.slice(0, k);
+    let wSum = 0, valSum = 0;
+    for (const c of nearest) {
+      const w = 1 / (c.dist + 1e-6); // inverse-distance weighting; epsilon avoids div-by-zero on an exact match
+      wSum += w;
+      valSum += w * c.val;
+    }
+    filledValues[i] = valSum / wSum;
+    imputed++;
+  }
+  return { filledValues, imputed };
+}
+
 function mode(values) {
   const counts = new Map();
   for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
@@ -430,6 +498,25 @@ export function applyCleaning(rows, columns, config) {
         r[flagCol] = wasMissing[i] ? 1 : 0;
       });
       log.push(`"${colName}": filled ${filled} missing value(s) with column mode ("${fillValue}"); added "${flagCol}" flag.`);
+    } else if (strategy === 'knn') {
+      if (workingRows.length > MAX_KNN_ROWS) {
+        throw new Error(`"${colName}": KNN imputation needs the dataset under ${MAX_KNN_ROWS.toLocaleString()} rows (this file has ${workingRows.length.toLocaleString()}) -- use median or gap-aware fill instead.`);
+      }
+      const featureCols = workingColumns.filter((c) => c !== colName && !c.endsWith('_was_missing') && !c.endsWith('_outlier_flag'));
+      const numericFeatureCols = featureCols.filter((c) => detectColumnType(workingRows.map((r) => r[c])) === 'numeric');
+      workingRows.forEach((r, i) => { r[flagCol] = wasMissing[i] ? 1 : 0; });
+      if (!workingColumns.includes(flagCol)) workingColumns.push(flagCol);
+      if (!numericFeatureCols.length) {
+        log.push(`"${colName}": KNN imputation skipped -- no other numeric columns available to compute similarity from. Added "${flagCol}" flag.`);
+        continue;
+      }
+      const k = colConfig.knnK ?? DEFAULT_KNN_K;
+      const { filledValues, imputed } = knnImpute(workingRows, colName, numericFeatureCols, k);
+      workingRows.forEach((r, i) => {
+        if (wasMissing[i] && filledValues[i] !== null) r[colName] = filledValues[i];
+      });
+      log.push(`"${colName}": filled ${imputed} of ${nMissingBefore} missing value(s) via KNN (k=${k}) using ${numericFeatureCols.length} numeric feature column(s) [${numericFeatureCols.join(', ')}]; ${nMissingBefore - imputed} left missing (no usable neighbors). Added "${flagCol}" flag.`);
+      continue;
     } else if (strategy === 'group_median') {
       // Gap-length-aware, mirroring Script 09: short gaps interpolate,
       // medium gaps use same-(group, calendar-month) median, long gaps

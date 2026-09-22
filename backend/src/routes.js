@@ -49,7 +49,16 @@ export function buildRouter() {
     // re-running with different choices is deterministic and never
     // compounds a previous run's fills on top of itself.
     const before = profileDataset(s.original.rows, s.original.columns);
-    const result = applyCleaning(s.original.rows, s.original.columns, config);
+    let result;
+    try {
+      result = applyCleaning(s.original.rows, s.original.columns, config);
+    } catch (e) {
+      // applyCleaning throws for user-actionable config problems (e.g. a
+      // fuzzy-dedup/KNN row/unique-value cap exceeded) -- surface that
+      // message directly rather than letting it fall through to the
+      // generic 500 handler in server.js.
+      return res.status(400).json({ error: e.message });
+    }
     updateSessionCurrent(s.id, result);
     const after = profileDataset(result.rows, result.columns);
 

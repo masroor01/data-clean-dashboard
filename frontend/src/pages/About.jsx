@@ -29,7 +29,9 @@ export default function About() {
             trailing window when a date column is set (adapts to a trend/level shift over time instead
             of one fixed global fence) — always editable, never auto-applied.</li>
           <li>Fills missing values with gap-length-aware logic: short gaps are linearly interpolated,
-            medium gaps use a same-group/same-period median, long gaps are left missing on purpose.</li>
+            medium gaps use a same-group/same-period median, long gaps are left missing on purpose —
+            or via KNN, filling from the average of the k most similar rows (by every other numeric
+            column), which picks up multivariate structure a single-column median or mean can't see.</li>
           <li>Merges near-duplicate text values within a column (e.g. "Apple Inc." / "Apple" /
             "APPLE INC" → one canonical label) using a combination of edit-distance and token-overlap
             similarity, so both typos and abbreviation/subset variants get caught.</li>

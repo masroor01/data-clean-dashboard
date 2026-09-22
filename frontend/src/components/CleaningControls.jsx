@@ -6,6 +6,7 @@ const MISSING_OPTIONS = {
     { value: 'median', label: 'Fill with column median' },
     { value: 'mean', label: 'Fill with column mean' },
     { value: 'group_median', label: 'Gap-aware (interpolate short gaps, group/period median for medium gaps, leave long gaps)' },
+    { value: 'knn', label: 'KNN (fill from similar rows, using other numeric columns)' },
     { value: 'leave', label: 'Leave as missing' },
   ],
   categorical: [
@@ -58,6 +59,19 @@ function ColumnRow({ col, suggestion, config, onChange, dateColumns, hasDateColu
           <p className="text-xs text-[var(--text-muted)]">
             Uses the date column and group column selected above.
           </p>
+        )}
+        {config.missingStrategy === 'knn' && (
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-[var(--text-muted)]">k (neighbors):</span>
+            <input
+              type="number" min="1" max="50"
+              value={config.knnK ?? 5}
+              onChange={(e) => onChange({ ...config, knnK: Number(e.target.value) })}
+              className="w-16 rounded border px-1.5 py-0.5 bg-[var(--card-bg)]"
+              style={{ borderColor: 'var(--border-color-strong)' }}
+            />
+            <span className="text-[var(--text-muted)]">Fills from the k most similar rows, using every other numeric column.</span>
+          </div>
         )}
 
         {fuzzyEligible && (
